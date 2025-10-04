@@ -1,4 +1,4 @@
-from flask import Flask, render_template_string, jsonify, request, send_from_directory
+from flask import Flask, render_template_string, jsonify, request, send_from_directory, make_response
 from datetime import datetime, timedelta
 import json
 import os
@@ -29,7 +29,18 @@ def init_database():
             t1 REAL,
             t2 REAL,
             t3 REAL,
-            sensor_status TEXT DEFAULT 'active'
+            battery REAL,
+            battery_status TEXT,
+            sensor_status TEXT DEFAULT 'active',
+            wake_cause INTEGER,
+            wake_cause_name TEXT,
+            reset_reason INTEGER,
+            reset_reason_name TEXT,
+            boot_count INTEGER,
+            last_boot_count INTEGER,
+            probe_mode_completed BOOLEAN,
+            should_run_probe BOOLEAN,
+            rtc_sleep_armed BOOLEAN
         )
     ''')
     
@@ -133,7 +144,7 @@ class TemperatureDataManager:
         
         cutoff_time = datetime.now() - timedelta(hours=hours)
         cursor.execute('''
-            SELECT t1, t2, t3, timestamp
+            SELECT t1, t2, t3, battery, battery_status, timestamp
             FROM temperature_readings
             WHERE timestamp >= ?
         ''', (cutoff_time,))
@@ -142,7 +153,7 @@ class TemperatureDataManager:
         conn.close()
         
         if not data:
-            return {'t1': None, 't2': None, 't3': None}
+            return {'t1': None, 't2': None, 't3': None, 'battery': None, 'battery_status': None}
         
         stats = {}
         for sensor in ['t1', 't2', 't3']:
@@ -158,8 +169,8 @@ class TemperatureDataManager:
                 avg_val = statistics.mean(values)
                 
                 # Find timestamps for min/max
-                min_time = next(row[3] for row in data if (row[0] if sensor == 't1' else row[1] if sensor == 't2' else row[2]) == min_val)
-                max_time = next(row[3] for row in data if (row[0] if sensor == 't1' else row[1] if sensor == 't2' else row[2]) == max_val)
+                min_time = next(row[5] for row in data if (row[0] if sensor == 't1' else row[1] if sensor == 't2' else row[2]) == min_val)
+                max_time = next(row[5] for row in data if (row[0] if sensor == 't1' else row[1] if sensor == 't2' else row[2]) == max_val)
                 
                 stats[sensor] = {
                     'min': {'val': min_val, 'time': datetime.fromisoformat(min_time).strftime('%H:%M')},
@@ -169,6 +180,16 @@ class TemperatureDataManager:
                 }
             else:
                 stats[sensor] = None
+        
+        # Add battery data from latest reading
+        if data:
+            latest_battery = data[-1][3]  # battery column
+            latest_battery_status = data[-1][4]  # battery_status column
+            stats['battery'] = latest_battery
+            stats['battery_status'] = latest_battery_status
+        else:
+            stats['battery'] = None
+            stats['battery_status'] = None
         
         return stats
 
@@ -191,7 +212,32 @@ def submit():
         t3 = validate_temp(data.get("t3"))
         
         if t1 is not None or t2 is not None or t3 is not None:
-            data_manager.add_reading(t1, t2, t3, data.get("ts"))
+            # Store in database with debug data
+            conn = sqlite3.connect(DB_PATH)
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                INSERT INTO temperature_readings (
+                    timestamp, t1, t2, t3, battery, battery_status, sensor_status,
+                    wake_cause, wake_cause_name, reset_reason, reset_reason_name,
+                    boot_count, last_boot_count, probe_mode_completed, should_run_probe, rtc_sleep_armed
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                data_manager._format_timestamp(data.get("ts")), t1, t2, t3,
+                data.get("battery"), data.get("battery_status"), "active",
+                data.get("wake_cause"), data.get("wake_reason"),
+                data.get("reset_reason_code"), data.get("reset_reason"),
+                data.get("boot_count"), data.get("last_boot_count"),
+                data.get("probe_mode_completed"), data.get("should_run_probe"),
+                data.get("rtc_sleep_armed")
+            ))
+            
+            conn.commit()
+            conn.close()
+            
+            # Clear cache
+            data_manager.cache.clear()
+            
             return jsonify({"status": "ok", "message": "Data recorded successfully"}), 200
         else:
             return jsonify({"status": "error", "message": "No valid temperature data"}), 400
@@ -214,6 +260,36 @@ def get_stats():
     hours = request.args.get('hours', 24, type=int)
     stats = data_manager.get_statistics(hours)
     return jsonify(stats)
+
+@app.route("/api/debug")
+def get_debug():
+    """Get debug information from latest reading"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT wake_cause_name, reset_reason_name, boot_count, probe_mode_completed, battery, battery_status
+            FROM temperature_readings
+            ORDER BY timestamp DESC LIMIT 1
+        ''')
+        
+        row = cursor.fetchone()
+        conn.close()
+        
+        if row:
+            return jsonify({
+                "wake_reason": row[0],
+                "reset_reason": row[1],
+                "boot_count": row[2],
+                "probe_mode_completed": row[3],
+                "battery": row[4],
+                "battery_status": row[5]
+            })
+        else:
+            return jsonify({})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/api/health")
 def health_check():
@@ -577,6 +653,53 @@ TEMPLATE = """
                 grid-template-columns: 1fr;
             }
         }
+
+        /* Debug Section Styles */
+        .debug-section {
+            background: var(--bg-primary);
+            border-radius: 16px;
+            padding: 1.5rem;
+            box-shadow: var(--shadow);
+            margin-top: 1.5rem;
+        }
+
+        .section-title {
+            font-size: 1.25rem;
+            font-weight: 600;
+            color: var(--text-primary);
+            margin-bottom: 1rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .debug-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 1rem;
+        }
+
+        .debug-item {
+            display: flex;
+            flex-direction: column;
+            gap: 0.25rem;
+        }
+
+        .debug-label {
+            font-size: 0.875rem;
+            color: var(--text-secondary);
+            font-weight: 500;
+        }
+
+        .debug-value {
+            font-size: 1rem;
+            color: var(--text-primary);
+            font-weight: 600;
+        }
+
+        .stat-icon.battery {
+            background: linear-gradient(135deg, #10b981, #059669);
+        }
     </style>
 </head>
 <body>
@@ -720,6 +843,52 @@ TEMPLATE = """
                         <div class="stat-label">Max</div>
                         <div class="stat-value" id="t3Max">--</div>
                     </div>
+                </div>
+            </div>
+            
+            <!-- Battery Status Card -->
+            <div class="stat-card">
+                <div class="stat-header">
+                    <h3 class="stat-title">Battery Status</h3>
+                    <div class="stat-icon battery">
+                        <i class="fas fa-battery-three-quarters"></i>
+                    </div>
+                </div>
+                <div class="stat-content">
+                    <div class="stat-item">
+                        <div class="stat-label">Voltage</div>
+                        <div class="stat-value" id="batteryVoltage">--</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="stat-label">Status</div>
+                        <div class="stat-value" id="batteryStatus">--</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Debug Information Section -->
+        <div class="debug-section">
+            <h2 class="section-title">
+                <i class="fas fa-bug"></i>
+                Device Status
+            </h2>
+            <div class="debug-grid">
+                <div class="debug-item">
+                    <div class="debug-label">Wake Reason</div>
+                    <div class="debug-value" id="wakeReason">--</div>
+                </div>
+                <div class="debug-item">
+                    <div class="debug-label">Reset Reason</div>
+                    <div class="debug-value" id="resetReason">--</div>
+                </div>
+                <div class="debug-item">
+                    <div class="debug-label">Boot Count</div>
+                    <div class="debug-value" id="bootCount">--</div>
+                </div>
+                <div class="debug-item">
+                    <div class="debug-label">Probe Mode</div>
+                    <div class="debug-value" id="probeMode">--</div>
                 </div>
             </div>
         </div>
@@ -927,6 +1096,7 @@ TEMPLATE = """
                 updateChart(data);
                 updateStatistics(stats);
                 updateStatusBar(data, stats);
+                updateDebugInfo();
                 
                 hideLoading();
             } catch (error) {
@@ -994,6 +1164,15 @@ TEMPLATE = """
                     document.getElementById(`${sensor}Max`).textContent = '--';
                 }
             });
+            
+            // Update battery information
+            if (stats.battery !== undefined) {
+                document.getElementById('batteryVoltage').textContent = 
+                    stats.battery ? stats.battery.toFixed(2) + 'V' : '--';
+            }
+            if (stats.battery_status !== undefined) {
+                document.getElementById('batteryStatus').textContent = stats.battery_status || '--';
+            }
         }
 
         // Status bar updates
@@ -1014,6 +1193,23 @@ TEMPLATE = """
                 document.getElementById('avgTemp').textContent = avg.toFixed(1) + '°C';
             } else {
                 document.getElementById('avgTemp').textContent = '--';
+            }
+        }
+
+        // Debug information updates
+        async function updateDebugInfo() {
+            try {
+                const response = await fetch('/api/debug');
+                if (response.ok) {
+                    const debugData = await response.json();
+                    
+                    document.getElementById('wakeReason').textContent = debugData.wake_reason || '--';
+                    document.getElementById('resetReason').textContent = debugData.reset_reason || '--';
+                    document.getElementById('bootCount').textContent = debugData.boot_count || '--';
+                    document.getElementById('probeMode').textContent = debugData.probe_mode_completed ? 'Done' : 'Not Done';
+                }
+            } catch (error) {
+                console.error('Error loading debug info:', error);
             }
         }
 
@@ -1051,7 +1247,9 @@ TEMPLATE = """
 
 @app.route("/")
 def index():
-    return render_template_string(TEMPLATE)
+    response = make_response(render_template_string(TEMPLATE))
+    response.headers['Content-Security-Policy'] = "default-src * 'unsafe-inline' 'unsafe-eval' data: blob:; script-src * 'unsafe-inline' 'unsafe-eval'; style-src * 'unsafe-inline'; font-src *; connect-src *;"
+    return response
 
 if __name__ == "__main__":
     # Migrate existing JSON data to database
