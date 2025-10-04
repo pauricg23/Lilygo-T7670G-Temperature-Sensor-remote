@@ -92,31 +92,6 @@ Ensure your SIM card APN is set to "simbase" or modify in `setupLTE()`:
 sendATCommand("AT+CGDCONT=1,\"IP\",\"simbase\"", 2000);
 ```
 
-## Troubleshooting
-
-### Battery Shows "--%"
-- Ensure modem is powered on and ready
-- Check SIM card and network registration
-- Verify APN settings
-
-### OLED Not Displaying
-- Check I2C connections (SDA=21, SCL=22)
-- Verify display power supply
-- Check for I2C address conflicts
-
-### LTE Connection Issues
-- Verify SIM card has data plan
-- Check signal strength
-- Ensure APN is correctly configured
-- Check for network coverage
-
-### Excessive Network Registrations
-The code includes fixes for the common "225 registrations in 4 hours" issue:
-- Uses PSM instead of CFUN=0
-- Proper APN configuration
-- Cat-M only operation
-- Connection failure backoff
-
 ## File Structure
 
 ```
@@ -126,7 +101,6 @@ The code includes fixes for the common "225 registrations in 4 hours" issue:
 ├── working_2025-09-11.ino               # Previous working version
 ├── working_backup_20250915_100543.ino   # Backup version
 ├── platformio.ini                       # PlatformIO configuration
-├── .gitignore                           # Git ignore rules
 ├── include/                             # Header files
 ├── lib/                                # Library dependencies
 └── test/                               # Test files
